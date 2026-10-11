@@ -135,6 +135,17 @@ We love community contributions! To ensure high-quality updates, please follow t
       - default: Default (Apple Pill)
       - w11: Windows 11 (Rounded Box)
       - notch: macOS Notch (Top Edge Flush)
+  - ExpandedCornerRadius: '32'
+    $name: Expanded corner radius
+    $description: Adjust the corner roundness while the island is expanded. The collapsed pill keeps its normal shape.
+    $options:
+      - '20': 20 px
+      - '24': 24 px
+      - '28': 28 px
+      - '32': 32 px
+      - '36': 36 px
+      - '40': 40 px
+      - '44': 44 px (Pill)
   - ProgressStyle: slim
     $name: Progress bar style
     $description: Look of the song progress bar in the expanded media player. Wavy and Squiggle animate while music is playing and flatten when paused.
@@ -505,6 +516,7 @@ We love community contributions! To ensure high-quality updates, please follow t
 #include <mmdeviceapi.h>
 #include <mmreg.h>
 #include <mmsystem.h>
+#include <propsys.h>
 #include <objbase.h>
 #include <wrl/client.h>
 #include <uiautomation.h>
@@ -688,9 +700,17 @@ namespace IdleStripLayout {
 // section is added on the LEFT of the normal pill: [clock | divider] then the
 // usual cover ... spectrum. MeasureMediaPill (sizer) and DrawMedia (painter)
 // both read these so they cannot drift apart. With the option off the section
-// is 0 wide and the pill is exactly the old 150px.
+// is 0 wide and the pill uses only its metadata width.
 namespace MediaPillLayout {
-    constexpr float kBaseWidth = 150.0f;    // same as ActivityForKind's Media width
+    constexpr float kBaseWidth = 248.0f;
+    constexpr float kCollapsedHeight = 44.0f;
+    constexpr float kArtPadding = 6.0f;
+    constexpr float kArtHorizontalInset = 12.0f;
+    constexpr float kTextGap = 10.0f;
+    constexpr float kWaveformWidth = 28.0f;
+    constexpr float kWaveformRightInset = 20.0f;
+    constexpr float kWaveformTextGap = 10.0f;
+    constexpr float kPrivacyShift = 22.0f;
     constexpr float kClockPadLeft = 14.0f;  // left edge -> clock text
     constexpr float kSlotGap = 9.0f;        // clock text -> divider
     constexpr float kDividerWidth = 1.0f;
@@ -1019,6 +1039,7 @@ struct Settings {
     bool autoDpiScale = true;
     bool w11Style = false;
     bool notchStyle = false;
+    float expandedCornerRadius = 32.0f;
     // Color customization
     ThemePreset themePreset = ThemePreset::Obsidian;
     D2D1_COLOR_F pillBgColor = D2D1::ColorF(0.031f, 0.031f, 0.039f, 1.0f); // #08080A
@@ -1342,6 +1363,7 @@ std::atomic<bool> g_scrubbing = false;           // true while press-dragging th
 std::atomic<float> g_scrubDragFraction = 0.0f;   // live 0..1 drag position while g_scrubbing is true
 std::atomic<double> g_lastLiveSeekTime = 0.0;    // throttle gate for live seeks while dragging
 std::atomic<bool> g_audioCaptureNeeded = false;  // gates the WASAPI loopback thread
+std::atomic<float> g_audioVisualizerSensitivity = 1.0f;
 std::atomic<bool> g_manuallyHidden = false;      // user-toggled hide, via menu or hotkey
 UINT g_registeredHotkeyModifiers = 0;            // modifiers currently registered with the OS
 UINT g_registeredHotkeyVk = 0;                   // vk currently registered with the OS
@@ -2353,6 +2375,11 @@ void LoadSettings() {
         next.notchStyle = false;
     }
 
+    const std::wstring expandedRadius = GetStringSettingCopy(L"Appearance.ExpandedCornerRadius");
+    if (!expandedRadius.empty()) {
+        next.expandedCornerRadius = Clamp(static_cast<float>(_wtoi(expandedRadius.c_str())), 20.0f, 44.0f);
+    }
+
     // Color settings — check local theme override first, then settings YAML.
     // Palettes live in kThemePalettes at file scope so the right-click menu
     // resolves the same colors and labels this does.
@@ -2788,6 +2815,22 @@ int ResolveOffsetY(float windowHeight) {
     return static_cast<int>(std::lround(collapsed + (expanded - collapsed) * t));
 }
 
+float ResolveIslandRadius(float contentHeight, const Settings& settings) {
+    if (settings.notchStyle) {
+        return 16.0f;
+    }
+    if (settings.w11Style) {
+        return 8.0f;
+    }
+
+    const float collapsedRadius = std::min(contentHeight * 0.5f, 44.0f);
+    const float expansionRange = MediaLayout::kExpandedHeight - MediaLayout::kExpandedMinHeight;
+    const float expandedProgress = expansionRange > 0.0f
+        ? Clamp((contentHeight - MediaLayout::kExpandedMinHeight) / expansionRange, 0.0f, 1.0f)
+        : 1.0f;
+    return collapsedRadius + (settings.expandedCornerRadius - collapsedRadius) * expandedProgress;
+}
+
 void PositionOverlayWindow(HWND hwnd, int width, int height) {
     RECT work = GetAnchorWorkRect();
     const bool flushTop = g_settings.notchStyle || g_settings.borderMergedMode;
@@ -2877,16 +2920,9 @@ void ApplyBackdropRegion(HWND hwnd, int windowWidth, int windowHeight) {
     const int regionTop = std::max(0, top - kNudgeSlack);
     const int regionBottom = std::min(windowHeight, top + pillHeight + kNudgeSlack);
 
-    int radius;
-    if (g_settings.notchStyle) {
-        radius = static_cast<int>(std::round(16.0f * g_settings.sizeScale));
-    } else if (g_settings.w11Style) {
-        radius = static_cast<int>(std::round(8.0f * g_settings.sizeScale));
-    } else {
-        radius = static_cast<int>(std::round(
-            std::min(pillHeight * 0.5f, 44.0f * g_settings.sizeScale)));
-    }
-    radius = std::max(0, radius);
+    const float scale = std::max(0.05f, g_settings.sizeScale);
+    const int radius = std::max(0, static_cast<int>(std::round(
+        ResolveIslandRadius(static_cast<float>(pillHeight) / scale, g_settings) * scale)));
 
     // CreateRoundRectRgn takes the full ellipse size, not the corner radius.
     HRGN region = CreateRoundRectRgn(left, regionTop, left + pillWidth + 1, regionBottom + 1,
@@ -4888,10 +4924,19 @@ struct SpectrumAnalyzer {
     int   subStart[kSpectrumBands]{};
     float smooth[kSpectrumBands]{};
     float agc = 0.04f;
+    float sensitivity = 1.0f;
     float sampleRate = 0.0f;
     size_t write = 0;
     size_t sinceHop = 0;
     bool windowReady = false;
+
+    void Reset() {
+        std::fill(std::begin(ring), std::end(ring), 0.0f);
+        std::fill(std::begin(smooth), std::end(smooth), 0.0f);
+        agc = 0.04f;
+        write = 0;
+        sinceHop = 0;
+    }
 
     void Configure(float rate) {
         if (rate < 8000.0f) rate = 48000.0f;
@@ -4955,11 +5000,12 @@ struct SpectrumAnalyzer {
             peak = std::max(peak, amp);
         }
         agc = std::max(peak, agc * 0.9985f);
-        const float norm = 1.0f / std::max(agc, 0.02f);
+        const float norm = 1.0f / std::max(agc, 0.02f); 
         for (int b = 0; b < kSpectrumBands; ++b) {
             float v = std::sqrt(Clamp(raw[b] * norm, 0.0f, 1.0f));
             // Silence must stay silent even though the auto-gain is boosted.
             v *= Clamp(peak * 40.0f, 0.0f, 1.0f);
+            v *= sensitivity;
             smooth[b] += (v > smooth[b] ? 0.65f : 0.14f) * (v - smooth[b]);
         }
     }
@@ -5064,7 +5110,7 @@ void PushAudioChunks(BYTE* data, UINT32 frames, WAVEFORMATEX* format) {
     const bool is16 = format->wBitsPerSample == 16;
 
     if (!isFloat && !is16) {
-        PushWaveformSample(SampleAudioAmplitude(data, frames, format));
+        PushWaveformSample(SampleAudioAmplitude(data, frames, format) * 0.7f);
         return;
     }
 
@@ -5088,7 +5134,7 @@ void PushAudioChunks(BYTE* data, UINT32 frames, WAVEFORMATEX* format) {
             }
         }
 
-        PushWaveformSample(Clamp(static_cast<float>(std::sqrt(sum / samples) * 4.0), 0.0f, 1.0f));
+        PushWaveformSample(Clamp(static_cast<float>(std::sqrt(sum / samples) * 2.8), 0.0f, 1.0f));
     }
 }
 
@@ -5379,6 +5425,33 @@ DWORD WINAPI WeatherThreadProc(void*) {
     return 0;
 }
 
+constexpr PROPERTYKEY kDeviceEnumeratorNameKey = {
+    {0xA45C254E, 0xDF1C, 0x4EFD, {0x80, 0x20, 0x67, 0xD1, 0x46, 0xA8, 0x50, 0xE0}},
+    24,
+};
+
+bool IsBluetoothAudioEndpoint(IMMDevice* device) {
+    if (!device) {
+        return false;
+    }
+
+    ComPtr<IPropertyStore> properties;
+    if (FAILED(device->OpenPropertyStore(STGM_READ, &properties)) || !properties) {
+        return false;
+    }
+
+    PROPVARIANT value;
+    PropVariantInit(&value);
+    bool isBluetooth = false;
+    if (SUCCEEDED(properties->GetValue(kDeviceEnumeratorNameKey, &value)) &&
+        value.vt == VT_LPWSTR && value.pwszVal) {
+        const std::wstring enumerator = ToLowerCopy(value.pwszVal);
+        isBluetooth = enumerator.find(L"bth") != std::wstring::npos;
+    }
+    PropVariantClear(&value);
+    return isBluetooth;
+}
+
 DWORD WINAPI AudioThreadProc(void*) {
     HRESULT hrCo = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
@@ -5400,6 +5473,17 @@ DWORD WINAPI AudioThreadProc(void*) {
                                       CLSCTX_ALL, IID_PPV_ARGS(&enumerator));
         if (SUCCEEDED(hr)) {
             hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+        }
+        std::wstring activeEndpointId;
+        if (SUCCEEDED(hr)) {
+            LPWSTR endpointId = nullptr;
+            if (SUCCEEDED(device->GetId(&endpointId)) && endpointId) {
+                activeEndpointId = endpointId;
+                CoTaskMemFree(endpointId);
+            }
+            const float sensitivity = IsBluetoothAudioEndpoint(device.Get()) ? 0.60f : 1.0f;
+            g_audioVisualizerSensitivity.store(sensitivity, std::memory_order_relaxed);
+            g_spectrumAnalyzer.sensitivity = sensitivity;
         }
         if (SUCCEEDED(hr)) {
             hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
@@ -5433,11 +5517,32 @@ DWORD WINAPI AudioThreadProc(void*) {
         // don't flag a stall before the first packet has even arrived.
         double lastPacketTime = NowSeconds();
         double nextWatchdogCheck = lastPacketTime + 1.0;
+        double nextEndpointCheck = lastPacketTime + 0.5;
+        bool endpointChanged = false;
 
         while (WaitForSingleObject(g_stopEvent, 16) == WAIT_TIMEOUT) {
             if (!g_audioCaptureNeeded.load(std::memory_order_relaxed)) {
                 break;
             }
+
+            const double checkTime = NowSeconds();
+            if (!activeEndpointId.empty() && checkTime >= nextEndpointCheck) {
+                nextEndpointCheck = checkTime + 0.5;
+                ComPtr<IMMDevice> currentEndpoint;
+                if (SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &currentEndpoint)) &&
+                    currentEndpoint) {
+                    LPWSTR currentEndpointId = nullptr;
+                    if (SUCCEEDED(currentEndpoint->GetId(&currentEndpointId)) && currentEndpointId) {
+                        endpointChanged = activeEndpointId != currentEndpointId;
+                        CoTaskMemFree(currentEndpointId);
+                    }
+                }
+                if (endpointChanged) {
+                    Wh_Log(L"Default audio endpoint changed; reconnecting visualizer capture...");
+                    break;
+                }
+            }
+
             UINT32 packetFrames = 0;
             if (FAILED(capture->GetNextPacketSize(&packetFrames))) {
                 break;
@@ -5505,6 +5610,13 @@ DWORD WINAPI AudioThreadProc(void*) {
         client->Stop();
         if (mixFormat) {
             CoTaskMemFree(mixFormat);
+        }
+        if (endpointChanged) {
+            g_spectrumAnalyzer.Reset();
+            std::lock_guard lock(g_stateMutex);
+            g_state.waveform.fill(0.0f);
+            g_state.waveformWrite = 0;
+            g_state.bands.fill(0.0f);
         }
     }
 
@@ -7150,7 +7262,7 @@ class Renderer {
 
         if (width >= 2.0f && height >= 2.0f) {
             if (secondary) {
-                const float gap = 12.0f * settings.sizeScale;
+                const float gap = 20.0f * settings.sizeScale;
                 const float maxH = std::max(primary.height, secondary->height);
                 const float pTop = top + (maxH - primary.height) * 0.5f;
                 const float sTop = top + (maxH - secondary->height) * 0.5f;
@@ -7320,38 +7432,64 @@ class Renderer {
 
     // Collapsed media pill, with the optional clock. Returns content-space
     // sizes; the render loop multiplies by sizeScale like every other collapsed
-    // width. The pill is the normal 150px plus a clock section on the left, sized
-    // to the clock string (so seconds, 12h with AM/PM or a large Text size just
-    // make it wider). Measured in the widest-digit form so the width does not
-    // wobble as the digits change.
+    // width. The metadata width is measured from the actual title and artist,
+    // with the clock section added on the left when enabled.
     MediaPillMetrics MeasureMediaPill(const SharedState& state, const Settings& settings) {
         MediaPillMetrics metrics;
-        if (!settings.mediaPillClock) {
-            return metrics;
-        }
 
         // Same reasoning as MeasureIdleStrip: textScale drives this font size.
         EnsureTextFormats(settings.sizeScale, settings.fontFamily, settings.textScale);
-        IDWriteTextFormat* fmt = idleTextFormat_ ? idleTextFormat_.Get() : smallTextFormat_.Get();
+        if (settings.mediaPillClock) {
+            IDWriteTextFormat* fmt = idleTextFormat_ ? idleTextFormat_.Get() : smallTextFormat_.Get();
+            SYSTEMTIME local = {};
+            GetLocalTime(&local);
+            const std::wstring clock = FormatIslandTime(local, settings.clockFollowSystem,
+                                                        settings.use24HourClock, settings.showSeconds);
+            metrics.clockWidth =
+                MeasureTextWidthCached(WidestDigitForm(clock), fmt, idleClockWidthCache_);
 
-        SYSTEMTIME local = {};
-        GetLocalTime(&local);
-        const std::wstring clock = FormatIslandTime(local, settings.clockFollowSystem,
-                                                    settings.use24HourClock, settings.showSeconds);
-        // Same string, same format as the idle strip, so the cache is shared.
-        metrics.clockWidth =
-            MeasureTextWidthCached(WidestDigitForm(clock), fmt, idleClockWidthCache_);
+            float section = MediaPillLayout::kClockPadLeft + metrics.clockWidth +
+                            MediaPillLayout::kSlotGap + MediaPillLayout::kDividerWidth;
+            section = std::ceil(section / MediaPillLayout::kWidthQuantum) * MediaPillLayout::kWidthQuantum;
+            metrics.sectionWidth = section;
+        }
 
-        float section = MediaPillLayout::kClockPadLeft + metrics.clockWidth +
-                        MediaPillLayout::kSlotGap + MediaPillLayout::kDividerWidth;
-        section = std::ceil(section / MediaPillLayout::kWidthQuantum) * MediaPillLayout::kWidthQuantum;
-        metrics.sectionWidth = section;
-        metrics.totalWidth = MediaPillLayout::kBaseWidth + section;
+        const std::wstring title = state.media.title.empty()
+            ? std::wstring(Loc(L"Unknown"))
+            : state.media.title;
+        const std::wstring artist = state.media.artist.empty()
+            ? state.media.sourceName
+            : state.media.artist;
+        const float metadataWidth = std::max(
+            MeasureTextWidthCached(title, textFormat_.Get(), mediaTitleWidthCache_),
+            MeasureTextWidthCached(artist, smallTextFormat_.Get(), mediaArtistWidthCache_));
+
+        const float textLeftInset = MediaPillLayout::kArtHorizontalInset +
+            (MediaPillLayout::kCollapsedHeight - MediaPillLayout::kArtPadding * 2.0f) +
+            MediaPillLayout::kTextGap;
+        const float textRightInset = MediaPillLayout::kWaveformWidth +
+            MediaPillLayout::kWaveformRightInset + MediaPillLayout::kWaveformTextGap;
+        const bool hasPrivacyIndicator = state.system.micActive || state.system.cameraActive;
+        const float requiredWidth = metrics.sectionWidth + textLeftInset + metadataWidth +
+            textRightInset + (hasPrivacyIndicator ? MediaPillLayout::kPrivacyShift : 0.0f);
+
+        const float roundedWidth =
+            std::ceil(std::max(MediaPillLayout::kBaseWidth, requiredWidth) /
+                      MediaPillLayout::kWidthQuantum) * MediaPillLayout::kWidthQuantum;
+        const RECT workRect = GetAnchorWorkRect();
+        const float scale = std::max(settings.sizeScale, 0.05f);
+        if (workRect.right > workRect.left) {
+            const float maxWidth = std::max(
+                1.0f, static_cast<float>(workRect.right - workRect.left - 2 * kRenderPadX) / scale);
+            metrics.totalWidth = std::min(roundedWidth, maxWidth);
+        } else {
+            metrics.totalWidth = roundedWidth;
+        }
         return metrics;
     }
 
    private:
-    // Keyed on the string alone. EnsureTextFormats invalidates both caches
+    // Keyed on the string alone. EnsureTextFormats invalidates all cached widths
     // whenever it rebuilds the formats, so a cached width can never outlive the
     // font size it was measured at -- comparing the IDWriteTextFormat pointer
     // would not be enough, since a rebuilt format can land on the freed address.
@@ -7362,6 +7500,8 @@ class Renderer {
     };
     TextWidthCache idleClockWidthCache_;
     TextWidthCache idleWeatherWidthCache_;
+    TextWidthCache mediaTitleWidthCache_;
+    TextWidthCache mediaArtistWidthCache_;
 
     float MeasureTextWidthCached(const std::wstring& text, IDWriteTextFormat* fmt,
                                  TextWidthCache& cache) {
@@ -7448,6 +7588,8 @@ class Renderer {
         // width measured against the old ones is stale.
         idleClockWidthCache_.valid = false;
         idleWeatherWidthCache_.valid = false;
+        mediaTitleWidthCache_.valid = false;
+        mediaArtistWidthCache_.valid = false;
 
         textFormat_ = nullptr;
         smallTextFormat_ = nullptr;
@@ -7779,12 +7921,7 @@ class Renderer {
         const float h = (rect.bottom - rect.top) * scale;
         rect = D2D1::RectF(cx - w * 0.5f, cy - h * 0.5f, cx + w * 0.5f, cy + h * 0.5f);
 
-        float radius = settings.w11Style ? 8.0f * settings.sizeScale : (rect.bottom - rect.top) * 0.5f;
-        if (settings.notchStyle) {
-            radius = 16.0f * settings.sizeScale;
-        } else if (!settings.w11Style) {
-            radius = std::min(radius, 44.0f * settings.sizeScale);
-        }
+        const float radius = ResolveIslandRadius(h / settings.sizeScale, settings) * settings.sizeScale;
         DrawSoftShadow(rect, radius);
 
         DrawPillSurface(rect, radius, activity.kind, settings);
@@ -8073,32 +8210,68 @@ class Renderer {
         }
     }
 
-    ComPtr<ID2D1PathGeometry> CreateNotchGeometry(D2D1_RECT_F rect, float radius) {
+    ComPtr<ID2D1PathGeometry> CreateNotchGeometry(D2D1_RECT_F rect, float radius, float flare = 12.0f) {
         ComPtr<ID2D1PathGeometry> geom;
         if (FAILED(d2dFactory_->CreatePathGeometry(&geom))) return nullptr;
 
         ComPtr<ID2D1GeometrySink> sink;
         if (FAILED(geom->Open(&sink))) return nullptr;
 
-        float r = std::min({radius, (rect.right - rect.left) * 0.5f, (rect.bottom - rect.top) * 0.5f});
+        const float w = rect.right - rect.left;
+        const float h = rect.bottom - rect.top;
+
+        // Radius lekukan keluar di sudut atas (flare)
+        float f = std::max(0.0f, std::min({flare, w * 0.25f, h * 0.5f}));
+
+        // Body pill = rect dikurangi f di sisi kiri & kanan,
+        // supaya flare tetap berada di dalam rect (tidak ke-clip window)
+        const float bl = rect.left + f;
+        const float br = rect.right - f;
+        const float bw = br - bl;
+
+        // Radius sudut bawah (convex)
+        float r = std::min({radius, bw * 0.5f, h - f});
         if (r < 0.0f) r = 0.0f;
 
         sink->BeginFigure(D2D1::Point2F(rect.left, rect.top), D2D1_FIGURE_BEGIN_FILLED);
         sink->AddLine(D2D1::Point2F(rect.right, rect.top));
-        sink->AddLine(D2D1::Point2F(rect.right, rect.bottom - r));
-        if (r > 0.0f) {
+
+        // Atas kanan: lekukan keluar (cekung), pusat arc di (rect.right, rect.top + f)
+        if (f > 0.0f) {
             sink->AddArc(D2D1::ArcSegment(
-                D2D1::Point2F(rect.right - r, rect.bottom),
+                D2D1::Point2F(br, rect.top + f),
+                D2D1::SizeF(f, f), 0.0f,
+                D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE, D2D1_ARC_SIZE_SMALL));
+        }
+
+        sink->AddLine(D2D1::Point2F(br, rect.bottom - r));
+
+        if (r > 0.0f) {
+            // Bawah kanan (convex)
+            sink->AddArc(D2D1::ArcSegment(
+                D2D1::Point2F(br - r, rect.bottom),
                 D2D1::SizeF(r, r), 0.0f,
                 D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_SMALL));
-            sink->AddLine(D2D1::Point2F(rect.left + r, rect.bottom));
+            sink->AddLine(D2D1::Point2F(bl + r, rect.bottom));
+            // Bawah kiri (convex)
             sink->AddArc(D2D1::ArcSegment(
-                D2D1::Point2F(rect.left, rect.bottom - r),
+                D2D1::Point2F(bl, rect.bottom - r),
                 D2D1::SizeF(r, r), 0.0f,
                 D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_SMALL));
         } else {
-            sink->AddLine(D2D1::Point2F(rect.left, rect.bottom));
+            sink->AddLine(D2D1::Point2F(bl, rect.bottom));
         }
+
+        sink->AddLine(D2D1::Point2F(bl, rect.top + f));
+
+        // Atas kiri: lekukan keluar (cekung), pusat arc di (rect.left, rect.top + f)
+        if (f > 0.0f) {
+            sink->AddArc(D2D1::ArcSegment(
+                D2D1::Point2F(rect.left, rect.top),
+                D2D1::SizeF(f, f), 0.0f,
+                D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE, D2D1_ARC_SIZE_SMALL));
+        }
+
         sink->EndFigure(D2D1_FIGURE_END_CLOSED);
         sink->Close();
 
@@ -9381,7 +9554,7 @@ class Renderer {
         PublishContentGeometry(rect);
 
         const float dashHeight = rect.bottom - rect.top;
-        const float dashRadius = ContentIslandRadius(dashHeight);
+        const float dashRadius = ResolveIslandRadius(dashHeight, settings);
         ComPtr<ID2D1Geometry> dashMask = CreateIslandMaskGeometry(rect, dashRadius, g_settings.notchStyle);
         ComPtr<ID2D1Layer> dashLayer;
         target_->CreateLayer(&dashLayer);
@@ -9770,22 +9943,6 @@ class Renderer {
         g_mediaHitSeq.store(seq + 2, std::memory_order_relaxed);
     }
 
-    // Corner radius for the island mask in *content* space -- the coordinate
-    // system DrawMedia and DrawIdleDashboard are handed, which DrawPill scales
-    // by sizeScale afterwards. Because that scale is applied later, these radii
-    // must not be pre-multiplied by sizeScale. They previously were, so the
-    // stadium corner arc grew with the size scale until it cut across the album
-    // art's top-left corner (visible from roughly 2x upwards).
-    float ContentIslandRadius(float contentHeight) const {
-        if (g_settings.notchStyle) {
-            return 16.0f;
-        }
-        if (g_settings.w11Style) {
-            return 8.0f;
-        }
-        return std::min(contentHeight * 0.5f, 44.0f);
-    }
-
     // Takes settings by reference from Render()'s private copy rather than
     // reaching for g_settings. The dashboards it delegates to read std::wstring
     // members (DrawCalendarDashboard -> settings.dateFormat), which would
@@ -9799,7 +9956,7 @@ class Renderer {
 
         PublishContentGeometry(rect);
 
-        const float radius = ContentIslandRadius(height);
+        const float radius = ResolveIslandRadius(height, settings);
         ComPtr<ID2D1Geometry> mask = CreateIslandMaskGeometry(rect, radius, settings.notchStyle);
         ComPtr<ID2D1Layer> layer;
         target_->CreateLayer(&layer);
@@ -10037,7 +10194,7 @@ class Renderer {
             target_->PushLayer(D2D1::LayerParameters(rect, mask.Get(), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1::IdentityMatrix(), collapsedAlpha, nullptr, D2D1_LAYER_OPTIONS_NONE), layer.Get());
 
             const float cy = (rect.top + rect.bottom) * 0.5f;
-            const float artPadding = 6.0f;
+            const float artPadding = MediaPillLayout::kArtPadding;
             const float artSize = height - artPadding * 2.0f;
 
             // Optional clock section on the left. Zero wide when the option is
@@ -10048,17 +10205,40 @@ class Renderer {
             }
             const float clockSection = pillMetrics.sectionWidth;
 
-            D2D1_RECT_F artRect = D2D1::RectF(rect.left + clockSection + artPadding, cy - artSize * 0.5f,
-                                              rect.left + clockSection + artPadding + artSize, cy + artSize * 0.5f);
+            D2D1_RECT_F artRect = D2D1::RectF(rect.left + clockSection + MediaPillLayout::kArtHorizontalInset,
+                                              cy - artSize * 0.5f,
+                                              rect.left + clockSection + MediaPillLayout::kArtHorizontalInset + artSize,
+                                              cy + artSize * 0.5f);
             DrawAlbumArtDrop(state.media, artRect, now, artSize * 0.5f);
+
+            const float textLeft = artRect.right + MediaPillLayout::kTextGap;
 
             float shiftX = 0.0f;
             if (state.system.micActive || state.system.cameraActive) {
-                shiftX = 22.0f;
+                shiftX = MediaPillLayout::kPrivacyShift;
             }
 
-            D2D1_RECT_F waveRect = D2D1::RectF(rect.right - 42.0f - shiftX, cy - 10.0f,
-                                               rect.right - 14.0f - shiftX, cy + 10.0f);
+            D2D1_RECT_F waveRect = D2D1::RectF(
+                rect.right - MediaPillLayout::kWaveformWidth - MediaPillLayout::kWaveformRightInset - shiftX,
+                cy - 10.0f,
+                rect.right - MediaPillLayout::kWaveformRightInset - shiftX,
+                cy + 10.0f);
+            const float textRight = waveRect.left - MediaPillLayout::kWaveformTextGap;
+            const std::wstring pillTitle = state.media.title.empty()
+                ? std::wstring(Loc(L"Unknown"))
+                : state.media.title;
+            const std::wstring pillArtist = state.media.artist.empty()
+                ? state.media.sourceName
+                : state.media.artist;
+            D2D1_RECT_F titleRect = D2D1::RectF(textLeft, cy - 15.0f, textRight, cy + 1.0f);
+            D2D1_RECT_F artistRect = D2D1::RectF(textLeft, cy + 1.0f, textRight, cy + 16.0f);
+            DrawMarqueeText(pillTitle, titleRect, textFormat_.Get(), textBrush_.Get(), now, 34.0f,
+                            marqueePillTitleCache_);
+            mutedBrush_->SetOpacity(0.82f);
+            DrawMarqueeText(pillArtist, artistRect, smallTextFormat_.Get(), mutedBrush_.Get(), now, 26.0f,
+                            marqueePillArtistCache_);
+            mutedBrush_->SetOpacity(0.75f);
+
             if (state.media.playing) {
                 DrawSpectrum(state, waveRect, settings, now);
             } else {
@@ -10446,8 +10626,7 @@ class Renderer {
             EnsureArtBitmap(media);
 
             D2D1_RECT_F dst = D2D1::RectF(rect.left, rect.top, rect.right, rect.bottom);
-            target_->DrawBitmap(artBitmap_.Get(), dst, 1.0f,
-                                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+            DrawCoverBitmap(artBitmap_.Get(), dst, 1.0f);
         } else {
             accentBrush_->SetOpacity(0.24f);
             target_->FillRoundedRectangle(D2D1::RoundedRect(rect, radius, radius), accentBrush_.Get());
@@ -11179,6 +11358,35 @@ class Renderer {
         return h;
     }
 
+    void DrawCoverBitmap(ID2D1Bitmap* bitmap, D2D1_RECT_F rect, float opacity) {
+        if (!bitmap) return;
+
+        const D2D1_SIZE_F bitmapSize = bitmap->GetSize();
+        const float destWidth = rect.right - rect.left;
+        const float destHeight = rect.bottom - rect.top;
+        if (bitmapSize.width <= 0.0f || bitmapSize.height <= 0.0f ||
+            destWidth <= 0.0f || destHeight <= 0.0f) {
+            return;
+        }
+
+        const float sourceAspect = bitmapSize.width / bitmapSize.height;
+        const float destAspect = destWidth / destHeight;
+        D2D1_RECT_F source = D2D1::RectF(0.0f, 0.0f, bitmapSize.width, bitmapSize.height);
+        if (sourceAspect > destAspect) {
+            const float cropWidth = bitmapSize.height * destAspect;
+            const float inset = (bitmapSize.width - cropWidth) * 0.5f;
+            source.left = inset;
+            source.right = bitmapSize.width - inset;
+        } else if (sourceAspect < destAspect) {
+            const float cropHeight = bitmapSize.width / destAspect;
+            const float inset = (bitmapSize.height - cropHeight) * 0.5f;
+            source.top = inset;
+            source.bottom = bitmapSize.height - inset;
+        }
+
+        target_->DrawBitmap(bitmap, rect, opacity, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, &source);
+    }
+
     void DrawArtFace(ID2D1Bitmap* bitmap, D2D1_RECT_F rect, float radius) {
         ComPtr<ID2D1RoundedRectangleGeometry> mask;
         HRESULT hrMask = d2dFactory_->CreateRoundedRectangleGeometry(D2D1::RoundedRect(rect, radius, radius), &mask);
@@ -11191,7 +11399,7 @@ class Renderer {
             target_->PushAxisAlignedClip(rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         }
         if (bitmap) {
-            target_->DrawBitmap(bitmap, rect, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+            DrawCoverBitmap(bitmap, rect, 1.0f);
         } else {
             accentBrush_->SetOpacity(0.24f);
             target_->FillRoundedRectangle(D2D1::RoundedRect(rect, radius, radius), accentBrush_.Get());
@@ -11322,7 +11530,7 @@ class Renderer {
             target_->SetTransform(
                 D2D1::Matrix3x2F::Rotation(angle - lag * static_cast<float>(k), c) * scaled);
             if (bitmap) {
-                target_->DrawBitmap(bitmap, rect, a, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+                DrawCoverBitmap(bitmap, rect, a);
             } else {
                 accentBrush_->SetOpacity(0.24f);
                 target_->FillRoundedRectangle(D2D1::RoundedRect(rect, radius, radius), accentBrush_.Get());
@@ -11807,8 +12015,9 @@ class Renderer {
     // Stacked LED cells per column with gravity-driven falling peak caps.
     void DrawSpectrumLed(const SharedState& state, D2D1_RECT_F rect, float dt) {
         const float w = rect.right - rect.left, h = rect.bottom - rect.top;
-        const float colGap = 1.8f, colW = 2.6f;
-        const int cols = std::clamp(static_cast<int>((w + colGap) / (colW + colGap)), 3, 14);
+        constexpr int kColumns = 6;
+        const float colGap = 1.8f;
+        const int cols = kColumns;
         const float cw = (w - colGap * (cols - 1)) / cols;
         const int rows = std::clamp(static_cast<int>(h / 3.6f), 4, 8);
         const float cellGap = 1.0f;
@@ -11825,12 +12034,12 @@ class Renderer {
 
         for (int c = 0; c < cols; ++c) {
             const int slot = dir >= 0.0f ? c : cols - 1 - c;  // order the scan reaches this column
-            // Same source as Classic Bars: each column reads the level history, newest on the
-            // right, so every column rises and falls with the music (no frequency tilt).
-            const size_t wfSize = state.waveform.size();
-            const size_t wfOffset = static_cast<size_t>(cols - c) * 3;
-            const size_t wfSrc = (state.waveformWrite + wfSize * 2 - wfOffset) % wfSize;
-            float v = Clamp(state.waveform[wfSrc], 0.03f, 1.0f);
+            // Four adjacent log-spaced bands per column: columns 0-1 bass,
+            // 2-3 vocal range, and 4-5 treble.
+            const float bandsPerColumn = static_cast<float>(kSpectrumBands) / kColumns;
+            const float firstBand = static_cast<float>(c) * bandsPerColumn;
+            const float bandEnergy = SpecBandRange(state, firstBand, firstBand + bandsPerColumn);
+            const float v = std::pow(Clamp(bandEnergy, 0.0f, 1.0f), 0.5f);
 
             // Falling peak cap with gravity; a hit snaps it up.
             float& pk = specPeak_[c];
@@ -11888,6 +12097,7 @@ class Renderer {
         const float barWidth = (availableW - gap * (count - 1)) / count;
         const float centerY = (rect.top + rect.bottom) * 0.5f;
         const float maxH = (rect.bottom - rect.top) * 0.86f;
+        const float sensitivity = g_audioVisualizerSensitivity.load(std::memory_order_relaxed);
 
         // Use a step size of 4 samples (approx 40ms) so bars aren't identical
         const size_t step = 4;
@@ -11897,7 +12107,8 @@ class Renderer {
             const size_t offset = (count - i) * step;
             const size_t source = (state.waveformWrite + state.waveform.size() - offset) %
                                   state.waveform.size();
-            const float amp = Clamp(state.waveform[source], 0.03f, 1.0f);
+            const float amp = std::max(
+                std::pow(Clamp(state.waveform[source], 0.0f, 1.0f), 0.2f) * sensitivity, 0.03f);
             float h = std::max(3.0f, amp * maxH);
             float glow = 0.0f;
 
@@ -12739,6 +12950,8 @@ class Renderer {
     MarqueeLayoutCache marqueeTitleCache_;
     MarqueeLayoutCache marqueeArtistCache_;
     MarqueeLayoutCache marqueeAlbumCache_;
+    MarqueeLayoutCache marqueePillTitleCache_;
+    MarqueeLayoutCache marqueePillArtistCache_;
     MarqueeLayoutCache marqueeClipboardCache_;
     MarqueeLayoutCache marqueeNotificationCache_;
     ComPtr<ID2D1Bitmap> artBitmap_;
@@ -12838,7 +13051,7 @@ Activity ActivityForKind(IslandKind kind, const Settings& settings, const Shared
     switch (kind) {
         case IslandKind::Media:
             activity.width = 150.0f;
-            activity.height = 44.0f;
+            activity.height = MediaPillLayout::kCollapsedHeight;
             break;
         case IslandKind::Progress:
             activity.width = 230.0f;
@@ -14269,8 +14482,8 @@ DWORD WINAPI RenderThreadProc(void*) {
             if (!isFullscreen && (isHoverExpanded || pinned || recentTrackChange)) {
                 primary.width = MediaLayout::kExpandedWidth * g_settings.sizeScale;
                 primary.height = MediaLayout::kExpandedHeight * g_settings.sizeScale;
-            } else if (g_settings.mediaPillClock) {
-                // Collapsed pill with the clock: 150px unless the clock needs more.
+            } else {
+                // Measure the collapsed metadata pill, including its optional clock section.
                 primary.width =
                     renderer.MeasureMediaPill(snapshot, g_settings).totalWidth *
                     g_settings.sizeScale;
